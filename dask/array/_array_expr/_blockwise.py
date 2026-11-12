@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numbers
 from collections.abc import Iterable
+from functools import partial
 
 import numpy as np
 import tlz as toolz
@@ -9,6 +10,7 @@ import tlz as toolz
 from dask import is_dask_collection
 from dask.array._array_expr._expr import ArrayExpr, unify_chunks_expr
 from dask.array._array_expr._utils import compute_meta
+from dask.array._broadcast import can_preserve_broadcast, preserve_broadcast
 from dask.array.core import (
     _elemwise_handle_where,
     _enforce_dtype,
@@ -298,6 +300,9 @@ class Elemwise(Blockwise):
                 }
             )
             op = _enforce_dtype
+
+        if self.where is True and can_preserve_broadcast(self.op):
+            op = partial(preserve_broadcast, op)
 
         return op, dtype, blockwise_kwargs
 

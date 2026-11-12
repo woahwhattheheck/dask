@@ -35,6 +35,7 @@ xr = import_optional_dependency("xarray", errors="ignore")
 from dask import compute, config, core
 from dask._task_spec import Alias, List, Task, TaskRef
 from dask.array import chunk
+from dask.array._broadcast import can_preserve_broadcast, preserve_broadcast
 from dask.array.chunk import getitem
 from dask.array.chunk_types import is_valid_array_chunk, is_valid_chunk_type
 
@@ -5187,6 +5188,7 @@ def elemwise(op, *args, out=None, where=True, dtype=None, name=None, **kwargs):
         name = f"{funcname(op)}-{tokenize(op, dtype, *args, where)}"
 
     blockwise_kwargs = dict(dtype=dtype, name=name, token=funcname(op).strip("_"))
+    keep_broadcast = where is True and can_preserve_broadcast(op)
 
     if where is not True:
         blockwise_kwargs["elemwise_where_function"] = op
@@ -5197,6 +5199,9 @@ def elemwise(op, *args, out=None, where=True, dtype=None, name=None, **kwargs):
         blockwise_kwargs["enforce_dtype"] = dtype
         blockwise_kwargs["enforce_dtype_function"] = op
         op = _enforce_dtype
+
+    if keep_broadcast:
+        op = partial(preserve_broadcast, op)
 
     result = blockwise(
         op,

@@ -6,10 +6,12 @@ import contextlib
 from collections.abc import Container, Iterable, Sequence
 from functools import wraps
 from numbers import Integral
+from typing import Any
 
 import numpy as np
 from tlz import concat
 
+from dask.array._broadcast import reduce_preserving_broadcast
 from dask.core import flatten
 
 
@@ -50,14 +52,38 @@ def keepdims_wrapper(a_callable):
 # Wrap NumPy functions to ensure they provide keepdims.
 sum = np.sum
 prod = np.prod
-min = np.min
-max = np.max
+
+
+def min(
+    x: Any, axis: int | tuple[int, ...] | None = None, *args: Any, **kwargs: Any
+) -> Any:
+    return reduce_preserving_broadcast(np.min, x, axis, *args, **kwargs)
+
+
+def max(
+    x: Any, axis: int | tuple[int, ...] | None = None, *args: Any, **kwargs: Any
+) -> Any:
+    return reduce_preserving_broadcast(np.max, x, axis, *args, **kwargs)
+
+
 argmin = keepdims_wrapper(np.argmin)
 nanargmin = keepdims_wrapper(np.nanargmin)
 argmax = keepdims_wrapper(np.argmax)
 nanargmax = keepdims_wrapper(np.nanargmax)
-any = np.any
-all = np.all
+
+
+def any(
+    x: Any, axis: int | tuple[int, ...] | None = None, *args: Any, **kwargs: Any
+) -> Any:
+    return reduce_preserving_broadcast(np.any, x, axis, *args, **kwargs)
+
+
+def all(
+    x: Any, axis: int | tuple[int, ...] | None = None, *args: Any, **kwargs: Any
+) -> Any:
+    return reduce_preserving_broadcast(np.all, x, axis, *args, **kwargs)
+
+
 nansum = np.nansum
 nanprod = np.nanprod
 

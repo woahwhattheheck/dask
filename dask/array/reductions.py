@@ -122,7 +122,7 @@ def chunk_min(x, axis=None, keepdims=None):
     if x.size == 0:
         return array_safe([], x, ndmin=x.ndim, dtype=x.dtype)
     else:
-        return np.min(x, axis=axis, keepdims=keepdims)
+        return chunk.min(x, axis=axis, keepdims=keepdims)
 
 
 @implements(np.max, np.amax)
@@ -146,7 +146,7 @@ def chunk_max(x, axis=None, keepdims=None):
     if x.size == 0:
         return array_safe([], x, ndmin=x.ndim, dtype=x.dtype)
     else:
-        return np.max(x, axis=axis, keepdims=keepdims)
+        return chunk.max(x, axis=axis, keepdims=keepdims)
 
 
 @derived_from(np)
