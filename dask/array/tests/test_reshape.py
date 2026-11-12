@@ -669,3 +669,26 @@ def test_flatten_unknown_chunks_known_empty(shape, unknown_axis):
     assert result.shape == (0,)
     assert all(c == 0 for c in result.chunks[0])
     assert_eq(result, expected.ravel())
+
+
+@pytest.mark.parametrize(
+    "shape,chunks",
+    [
+        ((1, 3, 4), ((0, 1), (3,), (2, 2))),
+        ((2, 1, 4), ((1, 1), (0, 1), (2, 2))),
+    ],
+)
+@pytest.mark.parametrize("merge_chunks", [True, False])
+def test_flatten_unknown_preserves_empty_singleton_chunks(shape, chunks, merge_chunks):
+    expected = np.arange(np.prod(shape)).reshape(shape)
+    known = da.from_array(expected, chunks=chunks)
+    unknown_chunks = known.chunks[:-1] + ((np.nan,) * len(known.chunks[-1]),)
+    arr = da.Array(known.dask, known.name, unknown_chunks, meta=known._meta)
+    assert_eq(arr, expected)
+
+    result = arr.reshape(-1, merge_chunks=merge_chunks)
+    assert_eq(result, expected.ravel())
+    if merge_chunks:
+        for i, length in enumerate(result.chunks[0]):
+            if length == 0:
+                assert result.blocks[i].compute().size == 0

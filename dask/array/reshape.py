@@ -315,6 +315,9 @@ def _reshape_unknown(x: Array, merge_chunks: bool, limit: int | str | None) -> A
         None,
         adjust_chunks={axis: chunks},
         concatenate=True,
+        # There is only one array to align. Preserve zero-length chunks on
+        # singleton axes instead of rechunking them and broadcasting data.
+        align_arrays=False,
         meta=meta_from_array(x, axis + 1),
     )
     if not axis:
