@@ -33,7 +33,7 @@ from dask.core import flatten
 xr = import_optional_dependency("xarray", errors="ignore")
 
 from dask import compute, config, core
-from dask._task_spec import Alias, List, Task, TaskRef
+from dask._task_spec import Alias, DataNode, List, Task, TaskRef
 from dask.array import chunk
 from dask.array.chunk import getitem
 from dask.array.chunk_types import is_valid_array_chunk, is_valid_chunk_type
@@ -281,9 +281,9 @@ def graph_from_arraylike(
     If ``inline_array`` is True, this make a Blockwise layer of slicing tasks where the
     array-like is embedded into every task.,
 
-    If ``inline_array`` is False, this inserts the array-like as a standalone value in
-    a MaterializedLayer, then generates a Blockwise layer of slicing tasks that refer
-    to it.
+    If ``inline_array`` is False, this inserts the array-like as a standalone
+    DataNode in a MaterializedLayer, then generates a Blockwise layer of slicing
+    tasks that refer to it.
 
     >>> dict(graph_from_arraylike(arr, chunks=(2, 3), shape=(4, 6), name="X", inline_array=True))  # doctest: +SKIP
     {(arr, 0, 0): (getter, arr, (slice(0, 2), slice(0, 3))),
@@ -294,7 +294,7 @@ def graph_from_arraylike(
     >>> dict(  # doctest: +SKIP
             graph_from_arraylike(arr, chunks=((2, 2), (3, 3)), shape=(4,6), name="X", inline_array=False)
         )
-    {"original-X": arr,
+    {"original-X": DataNode("original-X", arr),
      ('X', 0, 0): (getter, 'original-X', (slice(0, 2), slice(0, 3))),
      ('X', 1, 0): (getter, 'original-X', (slice(2, 4), slice(0, 3))),
      ('X', 1, 1): (getter, 'original-X', (slice(2, 4), slice(3, 6))),
@@ -331,7 +331,9 @@ def graph_from_arraylike(
         original_name = f"original-{name}"
 
         layers = {}
-        layers[original_name] = MaterializedLayer({original_name: arr})
+        layers[original_name] = MaterializedLayer(
+            {original_name: DataNode(original_name, arr)}
+        )
         layers[name] = core_blockwise(
             getitem,
             name,

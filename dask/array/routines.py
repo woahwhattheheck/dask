@@ -5,6 +5,7 @@ import warnings
 from collections.abc import Iterable
 from functools import partial, reduce, wraps
 from numbers import Integral, Real
+from typing import Any
 
 import numpy as np
 from tlz import concat, interleave, sliding_window
@@ -1981,10 +1982,31 @@ def expand_dims(a, axis):
     out_ndim = len(axis) + a.ndim
     axis = validate_axis(axis, out_ndim)
 
-    shape_it = iter(a.shape)
-    shape = [1 if ax in axis else next(shape_it) for ax in range(out_ndim)]
+    if len(set(axis)) != len(axis):
+        raise ValueError("repeated axis")
+    if not axis:
+        return a
 
-    return a.reshape(shape)
+    # Adding singleton dimensions does not require rechunking. Keep the
+    # operation symbolic instead of creating a reshape task for every block.
+    return blockwise(
+        _expand_dims,
+        tuple(range(out_ndim)),
+        a,
+        tuple(ax for ax in range(out_ndim) if ax not in axis),
+        new_axes=dict.fromkeys(axis, 1),
+        axis=axis,
+        dtype=a.dtype,
+    )
+
+
+def _expand_dims(a: Any, axis: tuple[int, ...]) -> Any:
+    # Use the block's native reshape: not every supported array backend
+    # implements NumPy's expand_dims dispatch (for example, SciPy sparse).
+    shape = iter(a.shape)
+    return a.reshape(
+        tuple(1 if i in axis else next(shape) for i in range(a.ndim + len(axis)))
+    )
 
 
 @derived_from(np)

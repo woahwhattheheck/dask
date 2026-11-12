@@ -121,10 +121,14 @@ def test_graph_from_arraylike(inline_array):
         assert len(dsk.layers) == 2
         assert isinstance(hlg_layer_topological(dsk, 0), MaterializedLayer)
         assert isinstance(hlg_layer_topological(dsk, 1), Blockwise)
+    assert all(not layer.has_legacy_tasks for layer in dsk.layers.values())
     dsk = dict(dsk)
 
     # Somewhat odd membership check to avoid numpy elemwise __in__ overload
-    assert any(arr is v for v in dsk.values()) is not inline_array
+    assert (
+        any(isinstance(v, DataNode) and v.value is arr for v in dsk.values())
+        is not inline_array
+    )
 
 
 def test_top():
@@ -3034,8 +3038,8 @@ def test_from_array_inline():
 
     a = np.array([1, 2, 3]).view(MyArray)
     dsk = dict(da.from_array(a, name="my-array", inline_array=False).dask)
-    assert dsk["original-my-array"] is not a
-    assert_eq(dsk["original-my-array"], a)
+    assert dsk["original-my-array"].value is not a
+    assert_eq(dsk["original-my-array"].value, a)
 
     dsk = dict(da.from_array(a, name="my-array", inline_array=True).dask)
     assert "original-my-array" not in dsk
@@ -3107,7 +3111,10 @@ def test_asarray_h5py(asarray, inline_array):
 
             # Check for the array in the dsk
             dsk = dict(x.dask)
-            assert (d in dsk.values()) is not inline_array
+            assert (
+                any(isinstance(v, DataNode) and v.value is d for v in dsk.values())
+                is not inline_array
+            )
             assert not any(isinstance(v, np.ndarray) for v in dsk.values())
 
 
@@ -5053,7 +5060,10 @@ def test_zarr_inline_array(inline_array):
     a = zarr.array([1, 2, 3])
     dsk = dict(da.from_zarr(a, inline_array=inline_array).dask)
     assert len(dsk) == (0 if inline_array else 1) + 1
-    assert (a in dsk.values()) is not inline_array
+    assert (
+        any(isinstance(v, DataNode) and v.value is a for v in dsk.values())
+        is not inline_array
+    )
 
 
 def test_zarr_existing_array():

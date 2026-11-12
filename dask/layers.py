@@ -3,18 +3,19 @@ from __future__ import annotations
 import functools
 import operator
 from itertools import product
+from math import prod
 from typing import TYPE_CHECKING
 
 import tlz as toolz
 from tlz.curried import map
 
 from dask._task_spec import Task, TaskRef
-from dask.base import tokenize
+from dask.base import clone_key, tokenize
 from dask.blockwise import Blockwise, BlockwiseDep, BlockwiseDepDict, blockwise_token
 from dask.core import flatten
-from dask.highlevelgraph import Layer
+from dask.highlevelgraph import Layer, MaterializedLayer
 from dask.tokenize import normalize_token
-from dask.utils import cached_cumsum
+from dask.utils import M, cached_cumsum
 
 if TYPE_CHECKING:
     import numpy as np
@@ -104,6 +105,130 @@ class ArrayValuesDep(ArrayBlockwiseDep):
 
     def __getitem__(self, idx: tuple):
         return self.values[idx]
+
+
+class ArrayReshapeLayer(Layer):
+    """Reshape corresponding blocks without enumerating the block grid.
+
+    Input and output blocks are paired in row-major order, after the caller
+    has selected compatible chunks. Only the requested tasks are constructed;
+    culling a slice therefore does not materialize the rest of the array.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        input_name: str,
+        input_numblocks: tuple[int, ...],
+        chunks: tuple[tuple[int | float, ...], ...],
+        output_blocks: set[tuple[int, ...]] | None = None,
+        annotations=None,
+        collection_annotations=None,
+    ):
+        super().__init__(annotations, collection_annotations)
+        self.name = name
+        self.input_name = input_name
+        self.input_numblocks = input_numblocks
+        self.chunks = chunks
+        self.numblocks = tuple(map(len, chunks))
+        self.output_blocks = output_blocks
+
+    @property
+    def has_legacy_tasks(self) -> bool:
+        return False
+
+    def is_materialized(self) -> bool:
+        return False
+
+    def __len__(self) -> int:
+        if self.output_blocks is not None:
+            return len(self.output_blocks)
+        return prod(self.numblocks)
+
+    def __iter__(self):
+        blocks = self.output_blocks
+        if blocks is None:
+            blocks = product(*(range(n) for n in self.numblocks))
+        return ((self.name, *block) for block in blocks)
+
+    def __contains__(self, key) -> bool:
+        if not isinstance(key, tuple) or len(key) != len(self.numblocks) + 1:
+            return False
+        if key[0] != self.name:
+            return False
+        block = key[1:]
+        if self.output_blocks is not None:
+            return block in self.output_blocks
+        return all(
+            isinstance(i, int) and 0 <= i < n for i, n in zip(block, self.numblocks)
+        )
+
+    def _input_key(self, block: tuple[int, ...]) -> tuple:
+        flat = 0
+        for i, n in zip(block, self.numblocks):
+            flat = flat * n + i
+        input_block = []
+        for n in reversed(self.input_numblocks):
+            flat, i = divmod(flat, n)
+            input_block.append(i)
+        return (self.input_name, *reversed(input_block))
+
+    def __getitem__(self, key):
+        if key not in self:
+            raise KeyError(key)
+        shape = tuple(c[i] for c, i in zip(self.chunks, key[1:]))
+        # Unknown metadata lengths are NaN; reshape infers a length with -1.
+        shape = tuple(-1 if size != size else size for size in shape)
+        return Task(key, M.reshape, TaskRef(self._input_key(key[1:])), shape)
+
+    def get_output_keys(self):
+        return self.keys()
+
+    def cull(self, keys, all_hlg_keys):
+        dependencies = {key: {self._input_key(key[1:])} for key in keys if key in self}
+        if len(dependencies) == len(self):
+            return self, dependencies
+        return (
+            ArrayReshapeLayer(
+                self.name,
+                self.input_name,
+                self.input_numblocks,
+                self.chunks,
+                output_blocks={key[1:] for key in dependencies},
+                annotations=self.annotations,
+                collection_annotations=self.collection_annotations,
+            ),
+            dependencies,
+        )
+
+    def clone(self, keys, seed, bind_to=None):
+        from dask.graph_manipulation import chunks
+
+        result = {}
+        bound = False
+        for key in self:
+            task = self[key]
+            if key in keys:
+                new_key = clone_key(key, seed)
+                substitutions = {
+                    dependency: clone_key(dependency, seed)
+                    for dependency in task.dependencies
+                    if dependency in keys
+                }
+                task = task.substitute(substitutions, key=new_key)
+                if bind_to is not None and not substitutions:
+                    task = Task(new_key, chunks.bind, task, TaskRef(bind_to))
+                    bound = True
+                key = new_key
+            result[key] = task
+        return (
+            MaterializedLayer(
+                result,
+                annotations=self.annotations,
+                collection_annotations=self.collection_annotations,
+            ),
+            bound,
+        )
 
 
 @normalize_token.register(ArraySliceDep)

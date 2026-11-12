@@ -3,16 +3,18 @@ from __future__ import annotations
 import math
 from functools import reduce
 from itertools import product
+from numbers import Number
 from operator import mul
 
 import numpy as np
 
 from dask._task_spec import Task, TaskRef
-from dask.array.core import Array
+from dask.array.core import Array, blockwise
 from dask.array.utils import meta_from_array
 from dask.base import tokenize
 from dask.core import flatten
 from dask.highlevelgraph import HighLevelGraph
+from dask.layers import ArrayReshapeLayer
 from dask.utils import M
 
 _not_implemented_message = """
@@ -280,6 +282,49 @@ def contract_tuple(chunks, factor):
     return tuple(out)
 
 
+def _reshape_unknown(x: Array, merge_chunks: bool, limit: int | str | None) -> Array:
+    """Flatten contiguous slabs without computing unknown chunk lengths."""
+    first_unknown = next(i for i, size in enumerate(x.shape) if np.isnan(size))
+    last_partitioned = max(
+        (i for i, count in enumerate(x.numblocks) if count > 1), default=0
+    )
+    axis = min(first_unknown, last_partitioned)
+    if merge_chunks:
+        # Keep the existing grouping by default. A prefix that already has
+        # unit chunks permits more independent output blocks without splitting.
+        axis = next((i for i in range(axis) if any(c != 1 for c in x.chunks[i])), axis)
+    if not merge_chunks and any(count > 1 for count in x.numblocks[axis + 1 :]):
+        raise ValueError(
+            "Cannot flatten this array with merge_chunks=False: preserving "
+            "C order requires merging chunks after an unknown dimension. "
+            "Use merge_chunks=True or call x.compute_chunk_sizes() first."
+        )
+
+    # With one element per preceding axis, each retained chunk covers a
+    # contiguous C-order interval. Unknown dimensions cannot be split this way.
+    if axis and not merge_chunks:
+        x = x.rechunk(dict.fromkeys(range(axis), 1), block_size_limit=limit)
+    trailing_size = math.prod(x.shape[axis + 1 :])
+    chunks = tuple(0 if c == 0 else c * trailing_size for c in x.chunks[axis])
+    slabs = blockwise(
+        M.reshape,
+        tuple(range(axis + 1)),
+        x,
+        tuple(range(x.ndim)),
+        (1,) * axis + (-1,),
+        None,
+        adjust_chunks={axis: chunks},
+        concatenate=True,
+        meta=meta_from_array(x, axis + 1),
+    )
+    if not axis:
+        return slabs
+
+    outchunks = (chunks * math.prod(x.numblocks[:axis]),)
+    name = "reshape-" + tokenize(slabs, outchunks)
+    return _reshape_from_chunks(slabs, outchunks, name)
+
+
 def reshape(x, shape, merge_chunks=True, limit=None):
     """Reshape array to new shape
 
@@ -308,6 +353,15 @@ def reshape(x, shape, merge_chunks=True, limit=None):
     2.  It only allows for reshapings that collapse or merge dimensions like
         ``(1, 2, 3, 4) -> (1, 6, 4)`` or ``(64,) -> (4, 4, 4)``
 
+    Arrays with unknown chunk lengths can be flattened with ``reshape(-1)``.
+    Chunks are concatenated into row-major slabs unless preceding dimensions
+    already have chunks of length one. Each slab must fit in memory; unknown
+    lengths prevent enforcing ``limit`` on these slabs. With
+    ``merge_chunks=False``, known preceding dimensions are split into chunks
+    of length one instead, potentially creating many tasks. This is unsupported
+    if preserving order still requires merging chunks after an unknown
+    dimension. Output chunk lengths may remain unknown.
+
     .. _`row-major order`: https://en.wikipedia.org/wiki/Row-_and_column-major_order
 
     When communication is necessary this algorithm depends on the logic within
@@ -324,19 +378,35 @@ def reshape(x, shape, merge_chunks=True, limit=None):
     # Sanitize inputs, look for -1 in shape
     from dask.array.slicing import sanitize_index
 
+    if isinstance(shape, Number):
+        shape = (shape,)
     shape = tuple(map(sanitize_index, shape))
+    # NumPy treats any negative dimension as the inferred dimension.
+    shape = tuple(-1 if s < 0 else s for s in shape)
+    empty = 0 in x.shape
+    size = 0 if empty else x.size
     known_sizes = [s for s in shape if s != -1]
     if len(known_sizes) < len(shape):
         if len(shape) - len(known_sizes) > 1:
             raise ValueError("can only specify one unknown dimension")
-        # Fastpath for x.reshape(-1) on 1D arrays, allows unknown shape in x
-        # for this case only.
-        if len(shape) == 1 and x.ndim == 1:
-            return x
-        missing_size = sanitize_index(x.size / reduce(mul, known_sizes, 1))
+        if len(shape) == 1:
+            if x.ndim == 1:
+                return x
+            if np.isnan(size):
+                return _reshape_unknown(x, merge_chunks, limit)
+        known_size = math.prod(known_sizes)
+        if known_size == 0:
+            raise ValueError("cannot infer an unknown dimension from a zero-size shape")
+        missing_size = sanitize_index(size // known_size)
         shape = tuple(missing_size if s == -1 else s for s in shape)
 
-    _sanity_checks(x, shape)
+    if empty:
+        # A zero dimension determines the total size even when filtering has
+        # left other dimensions unknown. Their lengths are not needed here.
+        if math.prod(shape) != 0:
+            raise ValueError("total size of new array must be unchanged")
+    else:
+        _sanity_checks(x, shape)
 
     if x.shape == shape:
         return x
@@ -344,6 +414,14 @@ def reshape(x, shape, merge_chunks=True, limit=None):
     meta = meta_from_array(x, len(shape))
 
     name = "reshape-" + tokenize(x, shape)
+
+    # There is no data to rechunk for an empty array. Reshape its empty metadata
+    # with the native backend so masked and sparse arrays keep their type.
+    if empty:
+        key = (name,) + (0,) * len(shape)
+        dsk = {key: Task(key, M.reshape, x._meta, shape)}
+        chunks = tuple((d,) for d in shape)
+        return Array(dsk, name, chunks, meta=meta)
 
     if x.npartitions == 1:
         key = next(flatten(x.__dask_keys__()))
@@ -362,17 +440,18 @@ def reshape(x, shape, merge_chunks=True, limit=None):
     inchunks, outchunks, _, _ = reshape_rechunk(x.shape, shape, x.chunks)
     x2 = x.rechunk(inchunks)
 
-    # Construct graph
-    in_keys = list(product([x2.name], *[range(len(c)) for c in inchunks]))
-    out_keys = list(product([name], *[range(len(c)) for c in outchunks]))
-    shapes = list(product(*outchunks))
-    dsk = {
-        a: Task(a, M.reshape, TaskRef(b), shape)
-        for a, b, shape in zip(out_keys, in_keys, shapes)
-    }
+    # Different chunk plans can select different values for the same block
+    # index. Their task keys must remain distinct in a joint computation.
+    name = "reshape-" + tokenize(x2, outchunks)
+    return _reshape_from_chunks(x2, outchunks, name)
 
-    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[x2])
-    return Array(graph, name, outchunks, meta=meta)
+
+def _reshape_from_chunks(
+    x: Array, outchunks: tuple[tuple[int | float, ...], ...], name: str
+) -> Array:
+    layer = ArrayReshapeLayer(name, x.name, x.numblocks, outchunks)
+    graph = HighLevelGraph.from_collections(name, layer, dependencies=[x])
+    return Array(graph, name, outchunks, meta=meta_from_array(x, len(outchunks)))
 
 
 def _sanity_checks(x, shape):

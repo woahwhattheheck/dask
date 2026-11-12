@@ -1566,7 +1566,9 @@ def test_ravel_with_array_like():
     assert isinstance(da.ravel([(0,), (0,)]), da.core.Array)
 
 
-@pytest.mark.parametrize("axis", [None, 0, 1, -1, (0, 1), (0, 2), (1, 2), 2])
+@pytest.mark.parametrize(
+    "axis", [None, 0, 1, -1, (0, 1), (0, 2), (1, 2), (2, 0), (-1, 0), (), 2]
+)
 def test_expand_dims(axis):
     a = np.arange(10)
     d = da.from_array(a, chunks=(3,))
@@ -1583,6 +1585,50 @@ def test_expand_dims(axis):
 
         assert_eq(d_e, a_e)
         assert same_keys(d_e, da.expand_dims(d, axis=axis))
+
+
+@pytest.mark.parametrize("axis", [(0, 0), (0, -3)])
+def test_expand_dims_repeated_axis(axis):
+    with pytest.raises(ValueError, match="repeated axis"):
+        da.expand_dims(da.arange(10, chunks=3), axis=axis)
+
+
+def test_expand_dims_lazy_layer():
+    # GH#12155: graph construction must not create a task for every chunk.
+    a = np.arange(600).reshape(20, 30)
+    d = da.from_array(a, chunks=(2, 3))
+    result = da.expand_dims(d, axis=(2, 0))
+
+    assert not result.dask.layers[result.name].is_materialized()
+    assert result.chunks == ((1,), d.chunks[0], (1,), d.chunks[1])
+    assert_eq(result, np.expand_dims(a, axis=(2, 0)))
+
+
+def test_expand_dims_unknown_chunks():
+    a = np.arange(10)
+    d = da.from_array(a, chunks=3)
+    filtered = d[d > 3]
+    result = da.expand_dims(filtered, axis=1)
+
+    assert np.isnan(result.chunks[0]).all()
+    assert result.chunks[1] == (1,)
+    assert_eq(result, np.expand_dims(a[a > 3], axis=1))
+
+
+@pytest.mark.parametrize("axis", [0, 1, -1])
+def test_expand_dims_scipy_sparse(axis):
+    pytest.importorskip("scipy", minversion="1.14")  # 1D sparse arrays
+    from scipy.sparse import csr_array, issparse
+
+    a = csr_array([1, 0, 2])
+    d = da.from_array(a, chunks=(3,))
+    result = da.expand_dims(d, axis)
+
+    assert issparse(result._meta)
+    assert not result.dask.layers[result.name].is_materialized()
+    actual = result.compute()
+    assert issparse(actual)
+    np.testing.assert_array_equal(actual.toarray(), np.expand_dims(a.toarray(), axis))
 
 
 @pytest.mark.parametrize("is_func", [True, False])
