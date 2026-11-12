@@ -20,6 +20,7 @@ from dask.array import chunk
 from dask.array.core import (
     Array,
     _concatenate2,
+    _elemwise_normalize_out,
     handle_out,
     implements,
     unknown_chunk_message,
@@ -68,6 +69,11 @@ def nannumel(x, **kwargs):
 
 @derived_from(np)
 def sum(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+    out = _elemwise_normalize_out(out)
+    if dtype is None and out is not None:
+        dtype = np.add.resolve_dtypes(
+            (out.dtype, a.dtype, None), reduction=True, casting="unsafe"
+        )[0]
     if dtype is None:
         dtype = getattr(np.zeros(1, dtype=a.dtype).sum(), "dtype", object)
     result = reduction(
@@ -85,6 +91,11 @@ def sum(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
 
 @derived_from(np)
 def prod(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+    out = _elemwise_normalize_out(out)
+    if dtype is None and out is not None:
+        dtype = np.multiply.resolve_dtypes(
+            (out.dtype, a.dtype, None), reduction=True, casting="unsafe"
+        )[0]
     if dtype is not None:
         dt = dtype
     else:
@@ -179,6 +190,11 @@ def all(a, axis=None, keepdims=False, split_every=None, out=None):
 
 @derived_from(np)
 def nansum(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+    out = _elemwise_normalize_out(out)
+    if dtype is None and out is not None:
+        dtype = np.add.resolve_dtypes(
+            (out.dtype, a.dtype, None), reduction=True, casting="unsafe"
+        )[0]
     if dtype is not None:
         dt = dtype
     else:
@@ -197,6 +213,11 @@ def nansum(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None)
 
 @derived_from(np)
 def nanprod(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+    out = _elemwise_normalize_out(out)
+    if dtype is None and out is not None:
+        dtype = np.multiply.resolve_dtypes(
+            (out.dtype, a.dtype, None), reduction=True, casting="unsafe"
+        )[0]
     if dtype is not None:
         dt = dtype
     else:
@@ -336,7 +357,8 @@ def mean_chunk(
 ):
     if computing_meta:
         return x
-    n = numel(x, dtype=dtype, **kwargs)
+    # Counts must not inherit a narrow or boolean accumulator dtype.
+    n = numel(x, dtype=np.int64, **kwargs)
 
     total = sum(x, dtype=dtype, **kwargs)
 
@@ -362,65 +384,91 @@ def mean_combine(
         return n
 
     totals = deepmap(lambda pair: pair["total"], pairs)
-    total = _concatenate2(totals, axes=axis).sum(axis=axis, **kwargs)
+    total = _concatenate2(totals, axes=axis).sum(axis=axis, dtype=dtype, **kwargs)
 
     return {"n": n, "total": total}
 
 
-def mean_agg(pairs, dtype="f8", axis=None, computing_meta=False, **kwargs):
+def mean_agg(
+    pairs, dtype="f8", axis=None, computing_meta=False, out_dtype=None, **kwargs
+):
     ns = deepmap(lambda pair: pair["n"], pairs) if not computing_meta else pairs
     n = _concatenate2(ns, axes=axis)
-    n = np.sum(n, axis=axis, dtype=dtype, **kwargs)
-
     if computing_meta:
-        return n
+        return np.sum(n, axis=axis, dtype=dtype, **kwargs)
+    n = np.sum(n, axis=axis, dtype=np.int64, **kwargs)
 
     totals = deepmap(lambda pair: pair["total"], pairs)
     total = _concatenate2(totals, axes=axis).sum(axis=axis, dtype=dtype, **kwargs)
 
+    if out_dtype is not None:
+        # NumPy stores the accumulated sum in out before dividing it.
+        total = total.astype(out_dtype)
+        dtype = out_dtype
     with np.errstate(divide="ignore", invalid="ignore"):
         return divide(total, n, dtype=dtype)
 
 
 @derived_from(np)
 def mean(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+    out = _elemwise_normalize_out(out)
+    is_float16_result = dtype is None and a.dtype == np.float16
     if dtype is not None:
         dt = dtype
+    elif is_float16_result:
+        dt = np.float32
     elif a.dtype == object:
         dt = object
+    elif out is not None and np.issubdtype(a.dtype, np.inexact):
+        dt = np.add.resolve_dtypes(
+            (out.dtype, a.dtype, None), reduction=True, casting="unsafe"
+        )[0]
     else:
         dt = getattr(np.mean(np.zeros(shape=(1,), dtype=a.dtype)), "dtype", object)
-    return reduction(
+    result = reduction(
         a,
         mean_chunk,
-        mean_agg,
+        partial(mean_agg, out_dtype=out.dtype if out is not None else None),
         axis=axis,
         keepdims=keepdims,
         dtype=dt,
         split_every=split_every,
-        combine=mean_combine,
+        combine=partial(mean_combine, dtype=dt),
         out=out,
         concatenate=False,
     )
+    if is_float16_result and out is None:
+        result = result.astype(np.float16)
+    return result
 
 
 @derived_from(np)
 def nanmean(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+    out = _elemwise_normalize_out(out)
     if dtype is not None:
         dt = dtype
+    elif out is not None and np.issubdtype(a.dtype, np.inexact):
+        dt = np.add.resolve_dtypes(
+            (out.dtype, a.dtype, None), reduction=True, casting="unsafe"
+        )[0]
     else:
         dt = getattr(np.mean(np.ones(shape=(1,), dtype=a.dtype)), "dtype", object)
+    if np.issubdtype(a.dtype, np.inexact):
+        if not np.issubdtype(dt, np.inexact):
+            raise TypeError("If a is inexact, then dtype must be inexact")
+        if out is not None and not np.issubdtype(out.dtype, np.inexact):
+            raise TypeError("If a is inexact, then out must be inexact")
     return reduction(
         a,
         partial(mean_chunk, sum=chunk.nansum, numel=nannumel),
-        mean_agg,
+        partial(mean_agg, out_dtype=out.dtype if out is not None else None),
         axis=axis,
         keepdims=keepdims,
         dtype=dt,
         split_every=split_every,
         out=out,
         concatenate=False,
-        combine=partial(mean_combine, sum=chunk.nansum, numel=nannumel),
+        combine=partial(mean_combine, sum=chunk.nansum, numel=nannumel, dtype=dt),
     )
 
 
@@ -516,6 +564,8 @@ def moment_agg(
     sum=np.sum,
     axis=None,
     computing_meta=False,
+    out_dtype=None,
+    nan_ddof=False,
     **kwargs,
 ):
     if not isinstance(pairs, list):
@@ -551,12 +601,16 @@ def moment_agg(
     denominator = n.sum(axis=axis, **kwargs) - ddof
 
     # taking care of the edge case with empty or all-nans array with ddof > 0
+    invalid = denominator <= 0 if nan_ddof else denominator < 0
     if isinstance(denominator, Number):
-        if denominator < 0:
+        if invalid:
             denominator = np.nan
     elif denominator is not np.ma.masked:
-        denominator[denominator < 0] = np.nan
+        denominator[invalid] = np.nan
 
+    if out_dtype is not None:
+        M = M.astype(out_dtype)
+        dtype = out_dtype
     return divide(M, denominator, dtype=dtype)
 
 
@@ -636,19 +690,92 @@ def moment(
     )
 
 
+def _var_two_pass(
+    a: Array,
+    axis: int | tuple[int, ...] | None,
+    dtype: np.dtype | None,
+    keepdims: bool,
+    ddof: float,
+    split_every: int | dict[int, int] | None,
+    out: Array | None,
+    is_nan: bool = False,
+) -> Array:
+    # Integer accumulation truncates the global mean and every squared
+    # deviation. Combining locally centered moments cannot reproduce this;
+    # keep the usual parallel moment algorithm for inexact accumulators.
+    # A different output dtype also affects the sum of squared deviations,
+    # without changing the precision of the mean.
+    mean_dtype = dtype
+    if mean_dtype is None:
+        mean_dtype = np.float64 if a.dtype.kind in "biu" else a.dtype
+    mean_func = nanmean if is_nan else mean
+    numel_func = nannumel if is_nan else numel
+    average = mean_func(
+        a, axis=axis, dtype=mean_dtype, keepdims=True, split_every=split_every
+    )
+    delta = a - average
+    if is_nan and np.issubdtype(a.dtype, np.inexact):
+        # nanvar centers and squares in the input buffer, even when its
+        # reductions use a higher-precision accumulator.
+        delta = delta.astype(a.dtype)
+    if is_nan:
+        # Ignore only NaNs in the original input. NaNs generated by centering
+        # infinities must propagate through the sum of squared deviations.
+        delta = da.where(a != a, 0, delta)
+    if np.issubdtype(a.dtype, np.complexfloating):
+        squared = (delta * delta.conj()).real
+    else:
+        squared = delta * delta
+    total = sum(
+        squared,
+        axis=axis,
+        dtype=dtype,
+        keepdims=keepdims,
+        split_every=split_every,
+        out=out.copy() if out is not None else None,
+    )
+    n = reduction(
+        a,
+        partial(numel_func, dtype=np.int64),
+        chunk.sum,
+        axis=axis,
+        dtype=np.int64,
+        keepdims=keepdims,
+        split_every=split_every,
+    )
+    denominator = n - ddof
+    if is_nan and np.issubdtype(a.dtype, np.inexact):
+        denominator = da.where(denominator <= 0, np.nan, denominator)
+    else:
+        denominator = da.maximum(denominator, 0)
+    result_dtype = total.dtype
+    result = da.map_blocks(
+        partial(divide, dtype=result_dtype),
+        total,
+        denominator,
+        dtype=result_dtype,
+    )
+    return handle_out(out, result)
+
+
 @derived_from(np)
 def var(a, axis=None, dtype=None, keepdims=False, ddof=0, split_every=None, out=None):
+    out = _elemwise_normalize_out(out)
     if dtype is not None:
         dt = dtype
     else:
         dt = getattr(np.var(np.ones(shape=(1,), dtype=a.dtype)), "dtype", object)
 
+    if np.dtype(dt).kind in "biu" or (out is not None and out.dtype != dt):
+        return _var_two_pass(a, axis, dtype, keepdims, ddof, split_every, out)
     implicit_complex_dtype = dtype is None and np.iscomplexobj(a)
 
     return reduction(
         a,
         partial(moment_chunk, implicit_complex_dtype=implicit_complex_dtype),
-        partial(moment_agg, ddof=ddof),
+        partial(
+            moment_agg, ddof=ddof, out_dtype=out.dtype if out is not None else None
+        ),
         axis=axis,
         keepdims=keepdims,
         dtype=dt,
@@ -664,11 +791,21 @@ def var(a, axis=None, dtype=None, keepdims=False, ddof=0, split_every=None, out=
 def nanvar(
     a, axis=None, dtype=None, keepdims=False, ddof=0, split_every=None, out=None
 ):
+    out = _elemwise_normalize_out(out)
     if dtype is not None:
         dt = dtype
     else:
         dt = getattr(np.var(np.ones(shape=(1,), dtype=a.dtype)), "dtype", object)
 
+    if np.issubdtype(a.dtype, np.inexact):
+        if not np.issubdtype(dt, np.inexact):
+            raise TypeError("If a is inexact, then dtype must be inexact")
+        if out is not None and not np.issubdtype(out.dtype, np.inexact):
+            raise TypeError("If a is inexact, then out must be inexact")
+    if np.dtype(dt).kind in "biu" or (out is not None and out.dtype != dt):
+        return _var_two_pass(
+            a, axis, dtype, keepdims, ddof, split_every, out, is_nan=True
+        )
     implicit_complex_dtype = dtype is None and np.iscomplexobj(a)
 
     return reduction(
@@ -679,7 +816,13 @@ def nanvar(
             numel=nannumel,
             implicit_complex_dtype=implicit_complex_dtype,
         ),
-        partial(moment_agg, sum=np.sum, ddof=ddof),
+        partial(
+            moment_agg,
+            sum=np.sum,
+            ddof=ddof,
+            out_dtype=out.dtype if out is not None else None,
+            nan_ddof=np.issubdtype(a.dtype, np.inexact),
+        ),
         axis=axis,
         keepdims=keepdims,
         dtype=dt,
@@ -712,6 +855,10 @@ def safe_sqrt(a):
 
 @derived_from(np)
 def std(a, axis=None, dtype=None, keepdims=False, ddof=0, split_every=None, out=None):
+    out = _elemwise_normalize_out(out)
+    if out is not None:
+        # Match sqrt's output-casting rule without evaluating the lazy array.
+        np.sqrt(np.empty(0, dtype=out.dtype), out=np.empty(0, dtype=out.dtype))
     result = safe_sqrt(
         var(
             a,
@@ -723,6 +870,8 @@ def std(a, axis=None, dtype=None, keepdims=False, ddof=0, split_every=None, out=
             out=out,
         )
     )
+    if out is not None:
+        return handle_out(out, result)
     if dtype and dtype != result.dtype:
         result = result.astype(dtype)
     return result
@@ -732,6 +881,9 @@ def std(a, axis=None, dtype=None, keepdims=False, ddof=0, split_every=None, out=
 def nanstd(
     a, axis=None, dtype=None, keepdims=False, ddof=0, split_every=None, out=None
 ):
+    out = _elemwise_normalize_out(out)
+    if out is not None:
+        np.sqrt(np.empty(0, dtype=out.dtype), out=np.empty(0, dtype=out.dtype))
     result = safe_sqrt(
         nanvar(
             a,
@@ -743,6 +895,8 @@ def nanstd(
             out=out,
         )
     )
+    if out is not None:
+        return handle_out(out, result)
     if dtype and dtype != result.dtype:
         result = result.astype(dtype)
     return result

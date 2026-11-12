@@ -5208,7 +5208,7 @@ def elemwise(op, *args, out=None, where=True, dtype=None, name=None, **kwargs):
         **blockwise_kwargs,
     )
 
-    return handle_out(out, result)
+    return handle_out(out, result, casting="same_kind")
 
 
 def _elemwise_normalize_where(where):
@@ -5243,7 +5243,7 @@ def _elemwise_normalize_out(out):
     return out
 
 
-def handle_out(out, result):
+def handle_out(out, result, *, casting="unsafe"):
     """Handle out parameters
 
     If out is a dask.array then this overwrites the contents of that array with
@@ -5256,6 +5256,7 @@ def handle_out(out, result):
                 "Mismatched shapes between result and out parameter. "
                 f"out={out.shape}, result={result.shape}"
             )
+        result = result.astype(out.dtype, casting=casting)
         out._chunks = result.chunks
         out.dask = result.dask
         out._meta = result._meta

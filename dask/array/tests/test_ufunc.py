@@ -443,10 +443,29 @@ def test_array_ufunc_binop():
 
 
 def test_array_ufunc_out():
-    x = da.arange(10, chunks=(5,))
-    np.sin(x, out=x)
-    np.add(x, 10, out=x)
-    assert_eq(x, np.sin(np.arange(10)) + 10)
+    x = da.arange(10, chunks=(5,), dtype=np.float32)
+    expected = np.arange(10, dtype=np.float32)
+    assert np.sin(x, out=x) is x
+    assert np.add(x, 10, out=x) is x
+    np.sin(expected, out=expected)
+    np.add(expected, 10, out=expected)
+    assert_eq(x, expected)
+
+
+@pytest.mark.parametrize(
+    "input_dtype, output_dtype", [("float64", "int16"), ("complex128", "float64")]
+)
+def test_array_ufunc_out_casting(input_dtype, output_dtype):
+    values = np.arange(1, 5, dtype=input_dtype)
+    source = da.from_array(values, chunks=2)
+    out = da.zeros(4, chunks=2, dtype=output_dtype)
+    original_graph = out.dask
+    with pytest.raises(TypeError):
+        np.sqrt(values, out=np.empty(4, dtype=output_dtype))
+    with pytest.raises(TypeError):
+        da.sqrt(source, out=out)
+    assert out.dask is original_graph
+    assert out.dtype == output_dtype
 
 
 def test_unsupported_ufunc_methods():

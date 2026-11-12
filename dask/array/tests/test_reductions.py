@@ -105,8 +105,17 @@ def reduction_1d_test(da_func, darr, np_func, narr, use_dtype=True, split_every=
     if use_dtype:
         with pytest.warns(ComplexWarning) if np.iscomplexobj(narr) else does_not_warn():
             assert_eq(da_func(darr, dtype="f8"), np_func(narr, dtype="f8"))
-            assert_eq(da_func(darr, dtype="i8"), np_func(narr, dtype="i8"))
-            assert same_keys(da_func(darr, dtype="i8"), da_func(darr, dtype="i8"))
+            if (
+                np_func in (np.nanmean, np.nanvar, np.nanstd)
+                and narr.dtype.kind in "fc"
+            ):
+                with pytest.raises(TypeError):
+                    np_func(narr, dtype="i8")
+                with pytest.raises(TypeError):
+                    da_func(darr, dtype="i8")
+            else:
+                assert_eq(da_func(darr, dtype="i8"), np_func(narr, dtype="i8"))
+                assert same_keys(da_func(darr, dtype="i8"), da_func(darr, dtype="i8"))
     if split_every:
         a1 = da_func(darr, split_every=2)
         a2 = da_func(darr, split_every={0: 2})
@@ -137,9 +146,9 @@ def test_reductions_1D(dtype):
 
     reduction_1d_test(da.nansum, a, np.nansum, x)
     reduction_1d_test(da.nanprod, a, np.nanprod, x)
-    reduction_1d_test(da.nanmean, a, np.mean, x)
-    reduction_1d_test(da.nanvar, a, np.var, x)
-    reduction_1d_test(da.nanstd, a, np.std, x)
+    reduction_1d_test(da.nanmean, a, np.nanmean, x)
+    reduction_1d_test(da.nanvar, a, np.nanvar, x)
+    reduction_1d_test(da.nanstd, a, np.nanstd, x)
     reduction_1d_test(da.nanmin, a, np.nanmin, x, False)
     reduction_1d_test(da.nanmax, a, np.nanmax, x, False)
 
@@ -196,7 +205,16 @@ def reduction_2d_test(da_func, darr, np_func, narr, use_dtype=True, split_every=
     if use_dtype:
         with pytest.warns(ComplexWarning) if np.iscomplexobj(narr) else does_not_warn():
             assert_eq(da_func(darr, dtype="f8"), np_func(narr, dtype="f8"))
-            assert_eq(da_func(darr, dtype="i8"), np_func(narr, dtype="i8"))
+            if (
+                np_func in (np.nanmean, np.nanvar, np.nanstd)
+                and narr.dtype.kind in "fc"
+            ):
+                with pytest.raises(TypeError):
+                    np_func(narr, dtype="i8")
+                with pytest.raises(TypeError):
+                    da_func(darr, dtype="i8")
+            else:
+                assert_eq(da_func(darr, dtype="i8"), np_func(narr, dtype="i8"))
 
     if split_every:
         a1 = da_func(darr, split_every=4)
@@ -254,7 +272,7 @@ def test_reductions_2D(dtype):
     reduction_2d_test(da.all, a, np.all, x, False)
 
     reduction_2d_test(da.nansum, a, np.nansum, x)
-    reduction_2d_test(da.nanmean, a, np.mean, x)
+    reduction_2d_test(da.nanmean, a, np.nanmean, x)
     reduction_2d_test(da.nanvar, a, np.nanvar, x, False)  # Difference in dtype algo
     reduction_2d_test(da.nanstd, a, np.nanstd, x, False)  # Difference in dtype algo
     reduction_2d_test(da.nanmin, a, np.nanmin, x, False)
@@ -643,7 +661,155 @@ def test_array_reduction_out(func):
     x = da.arange(10, chunks=(5,))
     y = da.ones((10, 10), chunks=(4, 4))
     func(y, axis=0, out=x)
-    assert_eq(x, func(np.ones((10, 10)), axis=0))
+    expected = np.arange(10)
+    func(np.ones((10, 10)), axis=0, out=expected)
+    assert_eq(x, expected)
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        "sum",
+        "prod",
+        "nansum",
+        "nanprod",
+        "mean",
+        "nanmean",
+        "var",
+        "nanvar",
+        "std",
+        "nanstd",
+    ],
+)
+@pytest.mark.parametrize("chunks", [1, 4])
+def test_reduction_integer_dtype_float_out(func, chunks):
+    # The final division takes place in out's dtype, after accumulation in int.
+    a = np.array([[1, 2, 3, 4], [-2, -1, 0, 0]])
+    expected = np.empty(2, dtype=np.float64)
+    out = da.empty(2, chunks=1, dtype=np.float64)
+    getattr(np, func)(a, axis=1, dtype=int, out=expected)
+    result = getattr(da, func)(
+        da.from_array(a, chunks=(1, chunks)), axis=1, dtype=int, out=out
+    )
+    assert result is out
+    assert_eq(result, expected)
+
+
+@pytest.mark.parametrize("chunks", [1, 4])
+def test_variance_integer_accumulation(chunks):
+    # Integer sums truncate each input before addition. Local floating moments
+    # and a final cast cannot reproduce a variance about the truncated mean.
+    a = np.array([0.9, 1.9, 3.9, 4.9])
+    x = da.from_array(a, chunks=chunks)
+    expected = np.empty((), dtype=float)
+    out = da.empty((), dtype=float)
+    np.var(a, dtype=int, out=expected)
+    assert_eq(da.var(x, dtype=int, out=out), expected)
+    assert_eq(da.var(x, dtype=int), np.var(a, dtype=int))
+
+
+@pytest.mark.parametrize(
+    "func", ["sum", "nansum", "mean", "nanmean", "var", "nanvar", "std", "nanstd"]
+)
+@pytest.mark.parametrize("dtype", [None, np.float32])
+def test_reduction_output_precision(func, dtype):
+    a = np.array([1e8, 1, -1e8], dtype=np.float32)
+    expected = np.empty((), dtype=np.float64)
+    out = da.empty((), dtype=np.float64)
+    getattr(np, func)(a, dtype=dtype, out=expected)
+    result = getattr(da, func)(da.from_array(a, chunks=3), dtype=dtype, out=out)
+    assert result is out
+    assert_eq(result, expected)
+
+
+@pytest.mark.parametrize("func", ["mean", "nanmean"])
+@pytest.mark.parametrize("dtype,values", [(np.int8, [1] * 128), (bool, [0, 0, 2])])
+def test_mean_counts_independent_of_dtype(func, dtype, values):
+    a = np.asarray(values)
+    expected = np.empty((), dtype=float)
+    getattr(np, func)(a, dtype=dtype, out=expected)
+    out = da.empty((), dtype=float)
+    result = getattr(da, func)(da.from_array(a, chunks=16), dtype=dtype, out=out)
+    assert_eq(result, expected)
+
+
+def test_mean_float16_accumulator():
+    a = np.array([60000, 60000], dtype=np.float16)
+    assert_eq(da.mean(da.from_array(a, chunks=1)), np.mean(a))
+
+
+@pytest.mark.parametrize("func", ["nanmean", "nanvar"])
+@pytest.mark.parametrize("integer_dtype", [True, False])
+def test_nan_reduction_requires_inexact_dtype_and_out(func, integer_dtype):
+    x = da.from_array(np.array([1.0, np.nan, 2.0]), chunks=1)
+    kwargs = {"dtype": int} if integer_dtype else {"out": da.empty((), dtype=int)}
+    with pytest.raises(TypeError, match="must be inexact"):
+        getattr(da, func)(x, **kwargs)
+
+
+@pytest.mark.parametrize("func", ["std", "nanstd"])
+def test_std_rejects_integer_out(func):
+    x = da.arange(4, chunks=1)
+    with pytest.raises(TypeError, match="Cannot cast ufunc 'sqrt'"):
+        getattr(da, func)(x, out=da.empty((), dtype=int))
+
+
+def test_variance_output_with_unknown_chunks():
+    a = np.array([1, np.nan, 0, 3, 4], dtype=np.float32)
+    x = da.from_array(a, chunks=2)
+    selected = x[x != 0]
+    expected = np.empty((), dtype=np.float64)
+    np.nanvar(a[a != 0], out=expected)
+    out = da.empty((), dtype=np.float64)
+    result = da.nanvar(selected, out=out)
+    assert result is out
+    assert_eq(result, expected)
+
+
+@pytest.mark.parametrize("out_dtype", [np.float32, np.float64])
+def test_nanvar_output_insufficient_degrees_of_freedom(out_dtype):
+    a = np.array([1.0, 2.0])
+    expected = np.empty((), dtype=out_dtype)
+    with pytest.warns(RuntimeWarning, match="Degrees of freedom"):
+        np.nanvar(a, ddof=2, out=expected)
+    result = da.nanvar(
+        da.from_array(a, chunks=1), ddof=2, out=da.empty((), dtype=out_dtype)
+    )
+    assert_eq(result, expected)
+
+
+def test_nanvar_output_alias_preserves_missing_values():
+    a = np.array([1.0, np.nan])
+    expected = a.copy()
+    with pytest.warns(RuntimeWarning, match="Degrees of freedom"):
+        np.nanvar(expected, axis=(), dtype=np.float32, out=expected)
+    x = da.from_array(a, chunks=1)
+    result = da.nanvar(x, axis=(), dtype=np.float32, out=x)
+    assert result is x
+    assert_eq(result, expected)
+
+
+def test_nanvar_output_preserves_input_buffer_precision():
+    a = np.array([0, 1000], dtype=np.float16)
+    expected = np.empty((), dtype=np.float32)
+    with pytest.warns(RuntimeWarning, match="overflow"):
+        np.nanvar(a, dtype=np.float64, out=expected)
+    result = da.nanvar(
+        da.from_array(a, chunks=1), dtype=np.float64, out=da.empty((), dtype=np.float32)
+    )
+    with pytest.warns(RuntimeWarning, match="overflow"):
+        assert_eq(result, expected)
+
+
+@pytest.mark.parametrize("values", [[np.inf, np.inf], [np.inf, 1.0]])
+def test_nanvar_output_preserves_generated_nans(values):
+    a = np.asarray(values)
+    expected = np.empty((), dtype=np.float32)
+    with pytest.warns(RuntimeWarning, match="invalid"):
+        np.nanvar(a, out=expected)
+    result = da.nanvar(da.from_array(a, chunks=1), out=da.empty((), dtype=np.float32))
+    with pytest.warns(RuntimeWarning, match="invalid"):
+        assert_eq(result, expected)
 
 
 @pytest.mark.parametrize("func", ["cumsum", "cumprod", "nancumsum", "nancumprod"])
